@@ -1,6 +1,22 @@
 # PathAI Engine — STUDOR DS Screening Project
 
-A data science pipeline for student engagement scoring, disengagement prediction, and course recommendations built on the Open University Learning Analytics Dataset (OULAD).
+A data science pipeline for student engagement scoring, disengagement prediction, and course recommendations built on the **Open University Learning Analytics Dataset (OULAD)**.
+
+## Dataset
+
+**Open University Learning Analytics Dataset (OULAD)**  
+- **Source**: https://www.kaggle.com/datasets/anlgrbz/student-demographics-online-education-dataoulad
+- **Size**: ~32,000 students across 7 courses (22 course-presentation pairs)
+- **Time Period**: Multiple academic presentations (semesters)
+- **Features**: 
+  - Student demographics (age, gender, education level, disability status, region)
+  - VLE (Virtual Learning Environment) clickstream activity (~10M interactions)
+  - Assessment scores and submission patterns
+  - Course registration and outcome labels (Pass/Fail/Withdrawn/Distinction)
+  
+**Citation**: Kuzilek, J., Hlosta, M., & Zdrahal, Z. (2017). Open University Learning Analytics Dataset. Scientific Data, 4, 170171.
+
+The dataset automatically downloads via `kagglehub` on first run. See Setup section below.
 
 ## Project Structure
 
