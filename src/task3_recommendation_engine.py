@@ -1,13 +1,13 @@
 """
 Task 3 - Course Recommendation Engine
-Recommends top-3 courses for students using:
+Recommends top-3 courses using:
   A) Content-based filtering (student profile + course metadata)
-  B) Collaborative filtering (interaction patterns of similar students)
-Includes cold-start handling and evaluation.
-
-Primary user: Students seeking next-semester course opportunities.
-Rationale: Students benefit most from personalized guidance; staff can then
-review recommendations in the advisor dashboard built in Task 2.
+  B) Collaborative filtering via SVD matrix factorization
+Improvements:
+  - SVD-based collaborative filtering (real interaction patterns)
+  - Diversity penalty (avoid recommending too-similar courses)
+  - Difficulty matching (struggling students get safer courses)
+  - NDCG@k evaluation metric
 """
 
 import numpy as np
@@ -17,7 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
-from collections import defaultdict
+from sklearn.decomposition import TruncatedSVD
 
 from src.data_loader import load_all, student_key_cols, course_key_cols
 from src.config import FIG_DIR, RANDOM_STATE
@@ -30,7 +30,6 @@ CKEY = course_key_cols()
 
 
 def build_student_profiles(tables):
-    """Build a feature profile per student-course enrollment."""
     si = tables["studentInfo"].copy()
 
     edu_map = {"No Formal quals": 0, "Lower Than A Level": 1, "A Level or Equivalent": 2,
@@ -44,7 +43,6 @@ def build_student_profiles(tables):
     si["gender_num"] = (si["gender"] == "M").astype(int)
     si["disability_num"] = (si["disability"] == "Y").astype(int)
 
-    # Aggregate VLE behavior per student-course
     svle_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "studentVle.csv")
     chunks = []
     for chunk in pd.read_csv(svle_path, chunksize=2_000_000,
@@ -56,7 +54,6 @@ def build_student_profiles(tables):
 
     vle_agg = pd.concat(chunks).groupby(KEY)["total_clicks"].sum().reset_index()
 
-    # Assessment performance
     sa = tables["studentAssessment"].merge(
         tables["assessments"][["id_assessment", "code_module", "code_presentation"]],
         on="id_assessment", how="left"
@@ -78,11 +75,9 @@ def build_student_profiles(tables):
 
 
 def build_course_profiles(tables):
-    """Build feature vectors for each course (module)."""
     si = tables["studentInfo"]
     courses = tables["courses"].copy()
 
-    # Aggregate student outcomes per course
     course_stats = si.groupby("code_module").agg(
         avg_pass_rate=("final_result", lambda x: (x.isin(["Pass", "Distinction"])).mean()),
         avg_distinction_rate=("final_result", lambda x: (x == "Distinction").mean()),
@@ -92,33 +87,52 @@ def build_course_profiles(tables):
         avg_credits=("studied_credits", "mean"),
     ).reset_index()
 
-    # Module length
     mod_len = courses.groupby("code_module")["module_presentation_length"].mean().reset_index()
     mod_len.rename(columns={"module_presentation_length": "avg_length"}, inplace=True)
 
-    course_profiles = course_stats.merge(mod_len, on="code_module", how="left")
-    return course_profiles
+    return course_stats.merge(mod_len, on="code_module", how="left")
 
 
 # ---------------------------------------------------------------------------
-# Approach A: Content-Based Filtering
+# Fix 5: Difficulty matching helper
+# Classifies courses as easy/medium/hard by pass rate
+# ---------------------------------------------------------------------------
+
+def _difficulty_label(pass_rate):
+    if pass_rate >= 0.60:
+        return "easy"
+    elif pass_rate >= 0.45:
+        return "medium"
+    else:
+        return "hard"
+
+
+def _student_ability(student_id, si_df):
+    """Estimate student ability from past outcomes."""
+    hist = si_df[si_df["id_student"] == student_id]
+    if len(hist) == 0:
+        return "unknown"
+    result_map = {"Distinction": 3, "Pass": 2, "Fail": 1, "Withdrawn": 0}
+    avg = hist["final_result"].map(result_map).mean()
+    if avg >= 2.5:
+        return "strong"
+    elif avg >= 1.5:
+        return "average"
+    else:
+        return "struggling"
+
+
+# ---------------------------------------------------------------------------
+# Approach A: Content-Based Filtering with difficulty matching
 # ---------------------------------------------------------------------------
 
 class ContentBasedRecommender:
-    """Recommends courses based on similarity between student profile
-    and course characteristics. Students who succeeded in similar courses
-    will be recommended courses with matching profiles."""
-
     def __init__(self, student_profiles, course_profiles, tables):
         self.tables = tables
-        self.student_profiles = student_profiles
-        self.course_profiles = course_profiles
-
-        # Build student-course success matrix
         self.si = tables["studentInfo"][KEY + ["final_result"]].copy()
         self.si["success"] = self.si["final_result"].isin(["Pass", "Distinction"]).astype(int)
+        self.course_profiles = course_profiles
 
-        # Course feature vectors (standardized)
         feat_cols = ["avg_pass_rate", "avg_distinction_rate", "withdrawal_rate",
                      "total_students", "avg_prev_attempts", "avg_credits", "avg_length"]
         self.scaler = StandardScaler()
@@ -127,9 +141,13 @@ class ContentBasedRecommender:
         )
         self.course_modules = course_profiles["code_module"].values
 
+        # Course difficulty labels for Fix 5
+        self.difficulty = {
+            row["code_module"]: _difficulty_label(row["avg_pass_rate"])
+            for _, row in course_profiles.iterrows()
+        }
+
     def recommend(self, student_id, n=3, exclude_modules=None, known_modules=None):
-        """Recommend top-n courses for a student based on their success profile.
-        known_modules: override which modules to treat as the student's history (for eval)."""
         if exclude_modules is None:
             exclude_modules = set()
 
@@ -150,134 +168,195 @@ class ContentBasedRecommender:
         student_vec = self.course_features[successful_idx].mean(axis=0).reshape(1, -1)
         sims = cosine_similarity(student_vec, self.course_features).flatten()
 
-        candidates = [
-            (self.course_modules[i], sims[i])
-            for i in range(len(self.course_modules))
-            if self.course_modules[i] not in exclude_modules
-        ]
+        # Fix 5: Difficulty matching — struggling students get easy/medium only
+        ability = _student_ability(student_id, self.si)
+        candidates = []
+        for i in range(len(self.course_modules)):
+            mod = self.course_modules[i]
+            if mod in exclude_modules:
+                continue
+            diff = self.difficulty.get(mod, "medium")
+            if ability == "struggling" and diff == "hard":
+                continue  # filter out hard courses for struggling students
+            candidates.append((mod, sims[i]))
+
+        # Fix 4: Diversity penalty — reduce score of courses too similar to top pick
         candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[:n]
+        selected = []
+        selected_vecs = []
+        for mod, score in candidates:
+            idx = np.where(self.course_modules == mod)[0]
+            if len(idx) == 0:
+                continue
+            cvec = self.course_features[idx[0]]
+            if selected_vecs:
+                max_sim_to_selected = max(
+                    cosine_similarity(cvec.reshape(1, -1), np.array(selected_vecs))[0]
+                )
+                score = score * (1 - 0.3 * max_sim_to_selected)  # 30% diversity penalty
+            selected.append((mod, round(float(score), 4)))
+            selected_vecs.append(cvec)
+            if len(selected) == n:
+                break
+
+        return selected if selected else self._cold_start_recommend(student_id, n, exclude_modules)
 
     def _cold_start_recommend(self, student_id, n, exclude_modules):
-        """Cold-start strategy: recommend courses with highest overall pass rate
-        and lowest withdrawal rate — safest choices for new students."""
         cp = self.course_profiles.copy()
         cp["cold_score"] = cp["avg_pass_rate"] * 0.6 - cp["withdrawal_rate"] * 0.4
         cp = cp[~cp["code_module"].isin(exclude_modules)]
         cp = cp.sort_values("cold_score", ascending=False)
-        return [(row["code_module"], row["cold_score"]) for _, row in cp.head(n).iterrows()]
+        return [(row["code_module"], round(float(row["cold_score"]), 4)) for _, row in cp.head(n).iterrows()]
 
 
 # ---------------------------------------------------------------------------
-# Approach B: Collaborative Filtering (User-Based)
+# Approach B: SVD-based Collaborative Filtering (Fix 3)
+# Uses actual student-course interaction matrix factorization
 # ---------------------------------------------------------------------------
 
 class CollaborativeRecommender:
-    """User-based collaborative filtering: find similar students based on
-    their course engagement patterns, recommend what similar students
-    succeeded in."""
+    """
+    SVD matrix factorization on the student-course success matrix.
+    Decomposes into latent factor representations for students and courses,
+    enabling recommendations based on actual interaction patterns.
+    """
 
-    def __init__(self, student_profiles, tables):
+    def __init__(self, student_profiles, tables, n_components=4):
         self.tables = tables
         si = tables["studentInfo"].copy()
-
-        # Build student-module success matrix
         si["success"] = si["final_result"].isin(["Pass", "Distinction"]).astype(float)
-        self.success_matrix = si.pivot_table(
+
+        # Student-course interaction matrix
+        self.interaction_matrix = si.pivot_table(
             index="id_student", columns="code_module", values="success", aggfunc="max"
         ).fillna(0)
 
-        # Build student feature matrix for similarity
+        self.student_ids = self.interaction_matrix.index.values
+        self.course_ids  = self.interaction_matrix.columns.values
+
+        # SVD decomposition
+        X = self.interaction_matrix.values
+        n_comp = min(n_components, min(X.shape) - 1)
+        self.svd = TruncatedSVD(n_components=n_comp, random_state=RANDOM_STATE)
+        self.student_factors = self.svd.fit_transform(X)           # (n_students, k)
+        self.course_factors  = self.svd.components_.T              # (n_courses, k)
+
+        # Student feature matrix for cold-start similarity
         feat_cols = ["edu_level", "age_num", "total_clicks", "mean_score",
                      "num_of_prev_attempts", "studied_credits"]
         student_avg = student_profiles.groupby("id_student")[feat_cols].mean().reset_index()
         student_avg = student_avg.set_index("id_student")
-
         self.scaler = StandardScaler()
-        valid_idx = student_avg.index.intersection(self.success_matrix.index)
-        self.student_features = pd.DataFrame(
+        valid_idx = student_avg.index.intersection(self.interaction_matrix.index)
+        self.student_feat_df = pd.DataFrame(
             self.scaler.fit_transform(student_avg.loc[valid_idx].fillna(0)),
-            index=valid_idx,
-            columns=feat_cols,
+            index=valid_idx, columns=feat_cols
         )
-        self.success_matrix = self.success_matrix.loc[valid_idx]
 
-    def recommend(self, student_id, n=3, exclude_modules=None, k_neighbors=20):
-        """Find k most similar students, recommend their successful courses."""
+        # Course difficulty for Fix 5
+        course_profiles = build_course_profiles(tables)
+        self.difficulty = {
+            row["code_module"]: _difficulty_label(row["avg_pass_rate"])
+            for _, row in course_profiles.iterrows()
+        }
+        self.course_profiles = course_profiles
+
+    def recommend(self, student_id, n=3, exclude_modules=None):
         if exclude_modules is None:
             exclude_modules = set()
 
-        if student_id not in self.student_features.index:
+        if student_id not in self.interaction_matrix.index:
             return self._cold_start_recommend(n, exclude_modules)
 
-        student_vec = self.student_features.loc[[student_id]].values
-        all_vecs = self.student_features.values
-        sims = cosine_similarity(student_vec, all_vecs).flatten()
+        # Reconstruct predicted scores via SVD latent factors
+        student_row_idx = np.where(self.student_ids == student_id)[0]
+        if len(student_row_idx) == 0:
+            return self._cold_start_recommend(n, exclude_modules)
 
-        sim_series = pd.Series(sims, index=self.student_features.index)
-        sim_series = sim_series.drop(student_id, errors="ignore")
-        top_neighbors = sim_series.nlargest(k_neighbors)
+        student_vec = self.student_factors[student_row_idx[0]]  # (k,)
+        predicted_scores = student_vec @ self.course_factors.T   # (n_courses,)
 
-        neighbor_success = self.success_matrix.loc[top_neighbors.index]
-        weights = top_neighbors.values.reshape(-1, 1)
-        weighted_scores = (neighbor_success.values * weights).sum(axis=0) / max(weights.sum(), 1e-9)
-        course_scores = pd.Series(weighted_scores, index=self.success_matrix.columns)
+        # Ability-based difficulty matching (Fix 5)
+        si_df = self.tables["studentInfo"][["id_student", "final_result"]]
+        ability = _student_ability(student_id, si_df)
 
-        course_scores = course_scores.drop(labels=list(exclude_modules), errors="ignore")
-        course_scores = course_scores.sort_values(ascending=False)
+        candidates = []
+        for i, mod in enumerate(self.course_ids):
+            if mod in exclude_modules:
+                continue
+            diff = self.difficulty.get(mod, "medium")
+            if ability == "struggling" and diff == "hard":
+                continue
+            candidates.append((mod, float(predicted_scores[i])))
 
-        return [(mod, score) for mod, score in course_scores.head(n).items()]
+        # Diversity penalty (Fix 4)
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        selected = []
+        selected_course_idxs = []
+        for mod, score in candidates:
+            mod_idx = np.where(self.course_ids == mod)[0]
+            if len(mod_idx) == 0:
+                continue
+            cvec = self.course_factors[mod_idx[0]]
+            if selected_course_idxs:
+                selected_vecs = self.course_factors[selected_course_idxs]
+                max_sim = max(cosine_similarity(cvec.reshape(1, -1), selected_vecs)[0])
+                score = score * (1 - 0.3 * max_sim)
+            selected.append((mod, round(score, 4)))
+            selected_course_idxs.append(mod_idx[0])
+            if len(selected) == n:
+                break
+
+        return selected if selected else self._cold_start_recommend(n, exclude_modules)
 
     def _cold_start_recommend(self, n, exclude_modules):
-        """Cold-start: recommend most universally successful courses."""
-        avg_success = self.success_matrix.mean(axis=0).sort_values(ascending=False)
+        avg_success = self.interaction_matrix.mean(axis=0).sort_values(ascending=False)
         avg_success = avg_success.drop(labels=list(exclude_modules), errors="ignore")
-        return [(mod, score) for mod, score in avg_success.head(n).items()]
+        return [(mod, round(float(score), 4)) for mod, score in avg_success.head(n).items()]
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation: NDCG@k + Hit Rate + Coverage
 # ---------------------------------------------------------------------------
+
+def ndcg_at_k(recommended, relevant_set, k=3):
+    """
+    Normalized Discounted Cumulative Gain @k.
+    Gives higher score when relevant items appear earlier in the list.
+    """
+    dcg = 0.0
+    for i, item in enumerate(recommended[:k]):
+        if item in relevant_set:
+            dcg += 1.0 / np.log2(i + 2)
+    ideal = sum(1.0 / np.log2(i + 2) for i in range(min(len(relevant_set), k)))
+    return dcg / ideal if ideal > 0 else 0.0
+
 
 def evaluate_recommendations(tables, content_rec, collab_rec, n=3):
-    """Evaluation using two metrics:
-    1. Success prediction: do recommended courses have higher success rates for similar students?
-    2. Coverage: how many distinct courses appear in recommendations?
-    3. Holdout hit rate: for multi-course students, can we recover a hidden successful course?
-    """
     si = tables["studentInfo"].copy()
     si["success"] = si["final_result"].isin(["Pass", "Distinction"]).astype(int)
     all_modules = set(si["code_module"].unique())
 
     np.random.seed(RANDOM_STATE)
 
-    # Metric 1: Average success rate of recommended courses for each student
-    sample_ids = si["id_student"].drop_duplicates().sample(min(1000, si["id_student"].nunique()), random_state=RANDOM_STATE)
-    student_actual = si.groupby("id_student")[["code_module", "success"]].apply(
-        lambda x: dict(zip(x["code_module"], x["success"]))
+    results = {
+        "Content-Based": {"ndcg": [], "hits": 0, "total": 0, "rec_modules": set()},
+        "Collaborative":  {"ndcg": [], "hits": 0, "total": 0, "rec_modules": set()},
+    }
+
+    # Coverage metric
+    sample_ids = si["id_student"].drop_duplicates().sample(
+        min(500, si["id_student"].nunique()), random_state=RANDOM_STATE
     )
-
-    results = {"Content-Based": {"avg_rec_success": [], "hits": 0, "total": 0, "rec_modules": set()},
-               "Collaborative": {"avg_rec_success": [], "hits": 0, "total": 0, "rec_modules": set()}}
-
     for sid in sample_ids:
         for name, rec in [("Content-Based", content_rec), ("Collaborative", collab_rec)]:
             try:
                 recs = rec.recommend(sid, n=n)
-                rec_modules = [r[0] for r in recs]
-                results[name]["rec_modules"].update(rec_modules)
-
-                # Check if student actually took any recommended courses and succeeded
-                if sid in student_actual.index:
-                    actual = student_actual[sid]
-                    for m in rec_modules:
-                        if m in actual:
-                            results[name]["avg_rec_success"].append(actual[m])
+                results[name]["rec_modules"].update(r[0] for r in recs)
             except Exception:
                 pass
 
-    # Metric 2: Holdout for multi-course students
-    # Hide one successful course, use remaining as "known history", check if hidden appears in recs
+    # Holdout NDCG@k
     multi = si[si["success"] == 1].groupby("id_student")["code_module"].apply(list).reset_index()
     multi = multi[multi["code_module"].apply(len) >= 2]
 
@@ -287,21 +366,21 @@ def evaluate_recommendations(tables, content_rec, collab_rec, n=3):
         hidden = np.random.choice(modules)
         visible = set(modules) - {hidden}
 
-        # Content-based: pass visible modules as known history, exclude visible from recs
         try:
             recs = content_rec.recommend(sid, n=n, exclude_modules=visible, known_modules=visible)
-            rec_modules = [r[0] for r in recs]
-            if hidden in rec_modules:
+            rec_mods = [r[0] for r in recs]
+            results["Content-Based"]["ndcg"].append(ndcg_at_k(rec_mods, {hidden}, k=n))
+            if hidden in rec_mods:
                 results["Content-Based"]["hits"] += 1
             results["Content-Based"]["total"] += 1
         except Exception:
             pass
 
-        # Collaborative: exclude visible modules from recs
         try:
             recs = collab_rec.recommend(sid, n=n, exclude_modules=visible)
-            rec_modules = [r[0] for r in recs]
-            if hidden in rec_modules:
+            rec_mods = [r[0] for r in recs]
+            results["Collaborative"]["ndcg"].append(ndcg_at_k(rec_mods, {hidden}, k=n))
+            if hidden in rec_mods:
                 results["Collaborative"]["hits"] += 1
             results["Collaborative"]["total"] += 1
         except Exception:
@@ -309,36 +388,45 @@ def evaluate_recommendations(tables, content_rec, collab_rec, n=3):
 
     print("\n  Evaluation Results:")
     for name, res in results.items():
-        avg_success = np.mean(res["avg_rec_success"]) if res["avg_rec_success"] else 0
-        hit_rate = res["hits"] / max(res["total"], 1)
-        coverage = len(res["rec_modules"]) / len(all_modules)
+        hit_rate  = res["hits"] / max(res["total"], 1)
+        mean_ndcg = np.mean(res["ndcg"]) if res["ndcg"] else 0
+        coverage  = len(res["rec_modules"]) / len(all_modules)
         print(f"\n    {name}:")
-        print(f"      Avg success rate of rec'd courses: {avg_success:.3f}")
         print(f"      Holdout hit rate @{n}: {res['hits']}/{res['total']} = {hit_rate:.3f}")
+        print(f"      NDCG@{n}: {mean_ndcg:.3f}  (rewards ranking the hidden item higher)")
         print(f"      Coverage: {len(res['rec_modules'])}/{len(all_modules)} = {coverage:.1%}")
-
-    baseline_success = si["success"].mean()
-    print(f"\n    Baseline success rate (random): {baseline_success:.3f}")
 
     return results
 
 
 def plot_recommendation_comparison(eval_results):
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     names = list(eval_results.keys())
-    hit_rates = [eval_results[n]["hits"] / max(eval_results[n]["total"], 1) for n in names]
     colors = ["#3498db", "#e74c3c"]
 
-    bars = ax.bar(names, hit_rates, color=colors, alpha=0.8, width=0.5)
+    # Hit rate
+    hit_rates = [eval_results[n]["hits"] / max(eval_results[n]["total"], 1) for n in names]
+    bars = axes[0].bar(names, hit_rates, color=colors, alpha=0.8, width=0.5)
     for bar, rate in zip(bars, hit_rates):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{rate:.1%}", ha="center", fontsize=12, fontweight="bold")
+        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                     f"{rate:.1%}", ha="center", fontsize=12, fontweight="bold")
+    axes[0].set_title("Hit Rate @3", fontweight="bold")
+    axes[0].set_ylabel("Hit Rate")
+    axes[0].set_ylim(0, 1.0)
+    axes[0].grid(True, axis="y", alpha=0.3)
 
-    ax.set_title("Recommendation Accuracy: Hit Rate @3", fontweight="bold")
-    ax.set_ylabel("Hit Rate (hidden course in top-3)")
-    ax.set_ylim(0, max(hit_rates) * 1.3 + 0.05)
-    ax.grid(True, axis="y", alpha=0.3)
+    # NDCG@k
+    ndcg_vals = [np.mean(eval_results[n]["ndcg"]) if eval_results[n]["ndcg"] else 0 for n in names]
+    bars2 = axes[1].bar(names, ndcg_vals, color=colors, alpha=0.8, width=0.5)
+    for bar, val in zip(bars2, ndcg_vals):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                     f"{val:.3f}", ha="center", fontsize=12, fontweight="bold")
+    axes[1].set_title("NDCG@3 (higher = better ranking quality)", fontweight="bold")
+    axes[1].set_ylabel("NDCG@3")
+    axes[1].set_ylim(0, 1.0)
+    axes[1].grid(True, axis="y", alpha=0.3)
 
+    plt.suptitle("Recommendation Engine — Content-Based vs SVD Collaborative", fontsize=13)
     plt.tight_layout()
     plt.savefig(os.path.join(FIG_DIR, "task3_recommendation_comparison.png"), dpi=150, bbox_inches="tight")
     plt.close()
@@ -346,30 +434,29 @@ def plot_recommendation_comparison(eval_results):
 
 
 def demo_recommendations(content_rec, collab_rec, tables):
-    """Show sample recommendations for 3 different student profiles."""
     si = tables["studentInfo"]
     np.random.seed(RANDOM_STATE)
 
-    # Pick 3 diverse students
     dist_students = si[si["final_result"] == "Distinction"]["id_student"].unique()
-    pass_students = si[si["final_result"] == "Pass"]["id_student"].unique()
+    pass_students  = si[si["final_result"] == "Pass"]["id_student"].unique()
+    fail_students  = si[si["final_result"] == "Fail"]["id_student"].unique()
 
     demo_ids = [
         np.random.choice(dist_students),
         np.random.choice(pass_students),
+        np.random.choice(fail_students),  # struggling student → difficulty matching applies
         -1,  # cold start
     ]
-    labels = ["High Achiever", "Average Student", "New Student (Cold Start)"]
+    labels = ["High Achiever", "Average Student", "Struggling Student (difficulty matching)", "New Student (Cold Start)"]
 
     print("\n  Sample Recommendations:")
-    print("  " + "-" * 55)
+    print("  " + "-" * 60)
     for sid, label in zip(demo_ids, labels):
         print(f"\n  {label} (ID: {sid}):")
-
         for name, rec in [("Content-Based", content_rec), ("Collaborative", collab_rec)]:
             try:
                 recs = rec.recommend(sid, n=3)
-                rec_str = ", ".join(f"{m} ({s:.2f})" for m, s in recs)
+                rec_str = ", ".join(f"{m}({s:.2f})" for m, s in recs)
                 print(f"    {name}: {rec_str}")
             except Exception as e:
                 print(f"    {name}: Error - {e}")
@@ -391,24 +478,24 @@ def run():
     print(f"  -> {len(course_profiles)} unique modules")
     print(course_profiles[["code_module", "avg_pass_rate", "withdrawal_rate", "total_students"]].to_string(index=False))
 
-    print("\n[3/5] Training Content-Based recommender...")
+    print("\n[3/5] Training Content-Based recommender (cosine sim + diversity penalty + difficulty matching)...")
     content_rec = ContentBasedRecommender(student_profiles, course_profiles, tables)
-    print("  -> Ready (cosine similarity on course feature vectors)")
+    print("  -> Ready")
 
-    print("\n[4/5] Training Collaborative Filtering recommender...")
-    collab_rec = CollaborativeRecommender(student_profiles, tables)
-    print(f"  -> Ready ({len(collab_rec.student_features)} students in similarity matrix)")
+    print("\n[4/5] Training SVD Collaborative Filtering recommender...")
+    collab_rec = CollaborativeRecommender(student_profiles, tables, n_components=4)
+    explained = collab_rec.svd.explained_variance_ratio_.sum()
+    print(f"  -> Ready (SVD: {collab_rec.svd.n_components} components, {explained:.1%} variance explained)")
 
-    print("\n[5/5] Evaluating and comparing...")
+    print("\n[5/5] Evaluating with Hit Rate @3 and NDCG@3...")
     eval_results = evaluate_recommendations(tables, content_rec, collab_rec)
     plot_recommendation_comparison(eval_results)
     demo_recommendations(content_rec, collab_rec, tables)
 
     print("\n  Cold-Start Strategy:")
-    print("  For new students with no history, we recommend courses with the")
-    print("  highest pass rates and lowest withdrawal rates — the 'safest' choices.")
-    print("  As the student completes their first course, the system switches to")
-    print("  personalized recommendations based on their actual performance.")
+    print("  For new students: recommend highest pass-rate / lowest withdrawal courses.")
+    print("  Difficulty matching: struggling students filtered from hard courses (< 45% pass rate).")
+    print("  Diversity penalty: 30% score reduction for courses similar to already-selected ones.")
 
     student_profiles.to_csv(os.path.join(FIG_DIR, "..", "task3_student_profiles.csv"), index=False)
     course_profiles.to_csv(os.path.join(FIG_DIR, "..", "task3_course_profiles.csv"), index=False)

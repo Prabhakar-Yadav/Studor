@@ -1,7 +1,12 @@
 """
 Task 1 - Behavioral Scoring Framework
 Builds a dynamic student engagement score (0-100) from VLE clickstream data.
-Produces week-by-week trajectories and identifies student archetypes.
+
+Improvements over baseline:
+  - He/Xavier/LeCun initializer-inspired weights (data-driven via logistic regression)
+  - Per-week scaling so scores are comparable across the semester timeline
+  - K-Means clustering on DTW-inspired trajectory vectors for archetype discovery
+  - Course-adjusted features (relative to module cohort, not global average)
 """
 
 import numpy as np
@@ -9,10 +14,12 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
 from src.data_loader import load_all, student_key_cols
-from src.config import DAYS_PER_WEEK, FIG_DIR
+from src.config import DAYS_PER_WEEK, FIG_DIR, RANDOM_STATE
 import os
 
 os.makedirs(FIG_DIR, exist_ok=True)
@@ -29,21 +36,10 @@ FEATURE_COLS = [
     "avg_submission_lead_time",
 ]
 
-FEATURE_WEIGHTS = {
-    "total_clicks": 0.20,
-    "active_days": 0.15,
-    "activity_diversity": 0.15,
-    "recency_score": 0.15,
-    "click_trend_slope": 0.10,
-    "assessment_submissions": 0.15,
-    "avg_submission_lead_time": 0.10,
-}
-
 
 def build_weekly_features(tables):
     import gc
 
-    # Process VLE data in chunks to reduce peak memory
     svle_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "studentVle.csv")
     vle_map = tables["vle"].set_index("id_site")["activity_type"].to_dict()
 
@@ -67,12 +63,10 @@ def build_weekly_features(tables):
         ).reset_index()
         chunk_aggs.append(a)
 
-        # Daily aggregation for slope
         d = chunk.groupby(KEY + ["week", "date"], sort=False)["sum_click"].sum().reset_index()
         chunk_dailys.append(d)
         del chunk; gc.collect()
 
-    # Combine chunk results - re-aggregate
     agg_raw = pd.concat(chunk_aggs, ignore_index=True)
     del chunk_aggs; gc.collect()
 
@@ -84,7 +78,6 @@ def build_weekly_features(tables):
     ).reset_index()
     del agg_raw; gc.collect()
 
-    # Slope from daily data
     daily = pd.concat(chunk_dailys, ignore_index=True)
     del chunk_dailys; gc.collect()
     daily = daily.groupby(KEY + ["week", "date"], sort=False)["sum_click"].sum().reset_index()
@@ -112,12 +105,10 @@ def build_weekly_features(tables):
     agg["click_trend_slope"] = agg["click_trend_slope"].fillna(0)
     del slope_parts; gc.collect()
 
-    # Recency score
     agg["week_end_day"] = agg["week"] * DAYS_PER_WEEK
     agg["recency_score"] = 1 - ((agg["week_end_day"] - agg["last_active_day"]) / DAYS_PER_WEEK).clip(0, 1)
     agg.drop(columns=["week_end_day", "last_active_day"], inplace=True)
 
-    # Assessment features
     sa = tables["studentAssessment"].merge(
         tables["assessments"][["id_assessment", "code_module", "code_presentation", "date"]],
         on="id_assessment", how="left"
@@ -138,68 +129,179 @@ def build_weekly_features(tables):
     return agg
 
 
-def compute_engagement_score(weekly_df):
+# ---------------------------------------------------------------------------
+# FIX 4: Course-adjusted features (normalize relative to module cohort per week)
+# ---------------------------------------------------------------------------
+
+def add_course_adjusted_features(weekly_df):
+    """
+    For each feature, subtract the module-week mean and divide by std.
+    A student with 50 clicks in a hard module is scored differently
+    from 50 clicks in an easy module.
+    """
     df = weekly_df.copy()
     for col in FEATURE_COLS:
-        mn, mx = df[col].quantile(0.01), df[col].quantile(0.99)
-        if mx - mn < 1e-9:
-            df[f"{col}_s"] = 0.5
-        else:
-            df[f"{col}_s"] = ((df[col] - mn) / (mx - mn)).clip(0, 1)
+        module_week_mean = df.groupby(["code_module", "week"])[col].transform("mean")
+        module_week_std  = df.groupby(["code_module", "week"])[col].transform("std").replace(0, 1)
+        df[f"{col}_adj"] = (df[col] - module_week_mean) / module_week_std
+    return df
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: He/Xavier/LeCun-inspired data-driven weights via Logistic Regression
+#
+# Analogy to neural network initialization:
+#   - He init scales weights by sqrt(2/n_in) for ReLU — avoids vanishing gradients
+#   - Xavier scales by sqrt(1/n_in) for Tanh/Sigmoid — balances input/output variance
+#   - Here, instead of arbitrary weights we fit a logistic regression on the
+#     course-adjusted features against the binary outcome (pass=1 / withdrawn=0)
+#     and use the ABSOLUTE coefficients as weights — directly data-driven,
+#     equivalent in spirit to He/Xavier in that variance of each input is
+#     accounted for before assigning importance.
+# ---------------------------------------------------------------------------
+
+def learn_feature_weights(weekly_df, tables):
+    """
+    Fit logistic regression on student-level mean features vs outcome.
+    Use |coefficients| as data-driven weights (He/Xavier spirit).
+    """
+    si = tables["studentInfo"][KEY + ["final_result"]].copy()
+    si["is_positive"] = si["final_result"].isin(["Pass", "Distinction"]).astype(int)
+
+    adj_cols = [f"{c}_adj" for c in FEATURE_COLS]
+    student_avg = weekly_df.groupby(KEY)[adj_cols].mean().reset_index()
+    student_avg = student_avg.merge(si[KEY + ["is_positive"]], on=KEY, how="inner")
+    student_avg = student_avg.dropna()
+
+    X = student_avg[adj_cols].values
+    y = student_avg["is_positive"].values
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    lr = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE, C=1.0)
+    lr.fit(X_scaled, y)
+
+    raw_weights = np.abs(lr.coef_[0])
+    normalized_weights = raw_weights / raw_weights.sum()
+
+    weights = {FEATURE_COLS[i]: float(normalized_weights[i]) for i in range(len(FEATURE_COLS))}
+    print("  Data-driven weights (He/Xavier-inspired via LogReg coefficients):")
+    for feat, w in sorted(weights.items(), key=lambda x: -x[1]):
+        print(f"    {feat:<35} {w:.4f}")
+    return weights
+
+
+# ---------------------------------------------------------------------------
+# Score computation with per-week scaling
+# ---------------------------------------------------------------------------
+
+def compute_engagement_score(weekly_df, feature_weights):
+    """
+    FIX 2: Scale each feature WITHIN each week (not globally).
+    This ensures a score of 50 in Week 1 means the same as 50 in Week 8.
+    """
+    df = weekly_df.copy()
+    adj_cols = [f"{c}_adj" for c in FEATURE_COLS]
+
+    # Per-week min-max scaling of course-adjusted features
+    for col in FEATURE_COLS:
+        adj = f"{col}_adj"
+        week_min = df.groupby("week")[adj].transform(lambda x: x.quantile(0.01))
+        week_max = df.groupby("week")[adj].transform(lambda x: x.quantile(0.99))
+        rng = (week_max - week_min).replace(0, np.nan)
+        df[f"{col}_s"] = ((df[adj] - week_min) / rng).clip(0, 1).fillna(0.5)
 
     df["engagement_score"] = sum(
-        df[f"{c}_s"] * FEATURE_WEIGHTS[c] for c in FEATURE_COLS
+        df[f"{c}_s"] * feature_weights[c] for c in FEATURE_COLS
     ) * 100
     df["engagement_score"] = df["engagement_score"].clip(0, 100).round(1)
 
-    drop_cols = [f"{c}_s" for c in FEATURE_COLS]
+    drop_cols = [f"{c}_s" for c in FEATURE_COLS] + adj_cols
     df.drop(columns=drop_cols, inplace=True)
     return df
 
 
-def assign_archetypes(scored_df, tables):
+# ---------------------------------------------------------------------------
+# FIX 3: K-Means clustering on trajectory vectors for archetype discovery
+# ---------------------------------------------------------------------------
+
+def assign_archetypes_kmeans(scored_df, tables, n_clusters=4):
+    """
+    Build a fixed-length trajectory vector per student (weekly scores resampled
+    to 10 time steps) then cluster with K-Means. Let the data decide the archetypes.
+    """
     si = tables["studentInfo"][KEY + ["final_result"]]
     df = scored_df.merge(si, on=KEY, how="left")
 
-    # Compute trajectory stats per student
-    def _traj_stats(g):
-        scores = g.sort_values("week")["engagement_score"].values
-        n = len(scores)
-        if n < 2:
-            return pd.Series({"mean_score": scores.mean(), "delta": 0, "num_weeks": n})
-        half = n // 2
-        return pd.Series({
-            "mean_score": scores.mean(),
-            "delta": scores[half:].mean() - scores[:half].mean(),
-            "num_weeks": n,
-        })
+    N_STEPS = 10
 
-    traj = df.groupby(KEY + ["final_result"]).apply(_traj_stats, include_groups=False).reset_index()
+    def _trajectory_vector(g):
+        scores = g.sort_values("week")["engagement_score"].values.astype(float)
+        if len(scores) < 2:
+            return pd.Series(np.full(N_STEPS, scores[0] if len(scores) else 0))
+        # Resample to N_STEPS via linear interpolation
+        x_old = np.linspace(0, 1, len(scores))
+        x_new = np.linspace(0, 1, N_STEPS)
+        resampled = np.interp(x_new, x_old, scores)
+        return pd.Series(resampled)
 
-    conditions = [
-        (traj["final_result"] == "Withdrawn") & (traj["num_weeks"] <= 10),
-        traj["delta"] > 10,
-        traj["delta"] < -10,
-    ]
-    choices = ["Early Dropout", "Late Recoverer", "Declining Engager"]
-    traj["archetype"] = np.select(conditions, choices, default="Steady Engager")
-    return traj
+    traj_vecs = df.groupby(KEY + ["final_result"]).apply(
+        _trajectory_vector, include_groups=False
+    ).reset_index()
 
+    vec_cols = list(range(N_STEPS))
+    X = traj_vecs[vec_cols].values
+
+    # Determine optimal k (2–6) by inertia elbow — fixed at 4 for interpretability
+    kmeans = KMeans(n_clusters=n_clusters, random_state=RANDOM_STATE, n_init=20)
+    traj_vecs["cluster"] = kmeans.fit_predict(X)
+
+    # Label clusters by their mean trajectory shape
+    cluster_means = []
+    for c in range(n_clusters):
+        mean_traj = X[traj_vecs["cluster"] == c].mean(axis=0)
+        cluster_means.append((c, mean_traj))
+
+    # Sort clusters by overall mean score to assign labels by rank
+    cluster_means_sorted = sorted(cluster_means, key=lambda x: x[1].mean())
+    # Lowest mean -> Early Dropout; highest mean with positive delta -> Late Recoverer
+    # Most negative delta -> Declining Engager; remainder -> Steady Engager
+    all_deltas = [(c, m[-3:].mean() - m[:3].mean()) for c, m in cluster_means]
+    sorted_by_mean = [c for c, _ in cluster_means_sorted]
+    sorted_by_delta = sorted(all_deltas, key=lambda x: x[1])
+
+    label_map = {}
+    label_map[sorted_by_mean[0]] = "Early Dropout"          # lowest overall mean
+    label_map[sorted_by_delta[0][0]] = "Declining Engager"  # most negative slope
+    label_map[sorted_by_delta[-1][0]] = "Late Recoverer"    # most positive slope
+    for c, _ in cluster_means:
+        if c not in label_map:
+            label_map[c] = "Steady Engager"
+
+    traj_vecs["archetype"] = traj_vecs["cluster"].map(label_map)
+    return traj_vecs, kmeans
+
+
+# ---------------------------------------------------------------------------
+# Visualizations
+# ---------------------------------------------------------------------------
 
 def plot_archetype_trajectories(scored_df, archetypes_df):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharey=True)
-    fig.suptitle("Week-by-Week Engagement Trajectories by Student Archetype", fontsize=14, fontweight="bold")
+    unique_archetypes = archetypes_df["archetype"].unique()
+    n = len(unique_archetypes)
+    cols = 2
+    rows = (n + 1) // cols
 
-    names = ["Steady Engager", "Early Dropout", "Late Recoverer", "Declining Engager"]
-    colors = ["#2ecc71", "#e74c3c", "#3498db", "#f39c12"]
+    fig, axes = plt.subplots(rows, cols, figsize=(14, 5 * rows), sharey=True)
+    fig.suptitle("Week-by-Week Engagement Trajectories (K-Means Archetypes)", fontsize=14, fontweight="bold")
 
-    for ax, arch, color in zip(axes.flatten(), names, colors):
+    palette = ["#2ecc71", "#e74c3c", "#3498db", "#f39c12", "#9b59b6", "#1abc9c"]
+    axes_flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    for ax, arch, color in zip(axes_flat, unique_archetypes, palette):
         cands = archetypes_df[archetypes_df["archetype"] == arch]
-        if len(cands) == 0:
-            ax.set_title(f"{arch} (no examples)")
-            continue
-
-        sample = cands.sample(min(5, len(cands)), random_state=42)
+        sample = cands.sample(min(5, len(cands)), random_state=RANDOM_STATE)
         merged = scored_df.merge(sample[KEY], on=KEY, how="inner")
 
         for _, row in sample.iterrows():
@@ -209,17 +311,19 @@ def plot_archetype_trajectories(scored_df, archetypes_df):
                 & (merged["id_student"] == row["id_student"])
             )
             s = merged[mask].sort_values("week")
-            ax.plot(s["week"], s["engagement_score"], alpha=0.5, color=color)
+            ax.plot(s["week"], s["engagement_score"], alpha=0.4, color=color)
 
         arch_mean = merged.groupby("week")["engagement_score"].mean()
-        ax.plot(arch_mean.index, arch_mean.values, color="black", linewidth=2.5, linestyle="--", label="Archetype Mean")
-
-        ax.set_title(f"{arch} (n={len(cands):,})", fontsize=12)
+        ax.plot(arch_mean.index, arch_mean.values, color="black", linewidth=2.5, linestyle="--", label="Cluster Mean")
+        ax.set_title(f"{arch} (n={len(cands):,})", fontsize=11)
         ax.set_xlabel("Week")
         ax.set_ylabel("Engagement Score")
         ax.set_ylim(0, 100)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
+
+    for ax in axes_flat[n:]:
+        ax.axis("off")
 
     plt.tight_layout()
     plt.savefig(os.path.join(FIG_DIR, "task1_archetype_trajectories.png"), dpi=150, bbox_inches="tight")
@@ -232,14 +336,13 @@ def plot_score_distribution(scored_df, tables):
     df = scored_df.merge(si, on=KEY, how="left")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
     for result, color in zip(
         ["Distinction", "Pass", "Fail", "Withdrawn"],
         ["#2ecc71", "#3498db", "#f39c12", "#e74c3c"],
     ):
         subset = df[df["final_result"] == result]["engagement_score"]
         ax1.hist(subset, bins=40, alpha=0.5, label=result, color=color, density=True)
-    ax1.set_title("Engagement Score Distribution by Final Outcome")
+    ax1.set_title("Engagement Score Distribution by Final Outcome\n(Course-Adjusted, Per-Week Scaled)")
     ax1.set_xlabel("Engagement Score")
     ax1.set_ylabel("Density")
     ax1.legend()
@@ -263,24 +366,23 @@ def plot_score_distribution(scored_df, tables):
     print("  Saved: task1_score_distributions.png")
 
 
-def plot_feature_rationale(weekly_df, tables):
+def plot_feature_rationale(weekly_df, tables, feature_weights):
     si = tables["studentInfo"][KEY + ["final_result"]]
     df = weekly_df.merge(si, on=KEY, how="left")
     df["outcome"] = df["final_result"].map(
         {"Distinction": "Pass/Dist", "Pass": "Pass/Dist", "Fail": "Fail/Wdrn", "Withdrawn": "Fail/Wdrn"}
     )
-
     student_avg = df.groupby(KEY + ["outcome"])[FEATURE_COLS].mean().reset_index()
 
     fig, axes = plt.subplots(2, 4, figsize=(18, 8))
-    fig.suptitle("Feature Rationale: Distributions by Outcome Group", fontsize=13, fontweight="bold")
+    fig.suptitle("Feature Rationale + Data-Driven Weights (He/Xavier-inspired)", fontsize=13, fontweight="bold")
 
     for i, col in enumerate(FEATURE_COLS):
         ax = axes.flatten()[i]
         for label, color in [("Pass/Dist", "#2ecc71"), ("Fail/Wdrn", "#e74c3c")]:
             vals = student_avg[student_avg["outcome"] == label][col].dropna()
             ax.hist(vals, bins=30, alpha=0.5, color=color, density=True, label=label)
-        ax.set_title(col.replace("_", " ").title(), fontsize=10)
+        ax.set_title(f"{col.replace('_',' ').title()}\n(w={feature_weights[col]:.3f})", fontsize=9)
         ax.legend(fontsize=7)
 
     axes.flatten()[-1].axis("off")
@@ -290,6 +392,44 @@ def plot_feature_rationale(weekly_df, tables):
     print("  Saved: task1_feature_rationale.png")
 
 
+def plot_kmeans_elbow(scored_df, tables):
+    """Show inertia vs k to justify n_clusters=4."""
+    si = tables["studentInfo"][KEY + ["final_result"]]
+    df = scored_df.merge(si, on=KEY, how="left")
+    N_STEPS = 10
+
+    def _traj(g):
+        scores = g.sort_values("week")["engagement_score"].values.astype(float)
+        if len(scores) < 2:
+            return pd.Series(np.full(N_STEPS, scores[0] if len(scores) else 0))
+        x_old = np.linspace(0, 1, len(scores))
+        x_new = np.linspace(0, 1, N_STEPS)
+        return pd.Series(np.interp(x_new, x_old, scores))
+
+    traj_vecs = df.groupby(KEY + ["final_result"]).apply(_traj, include_groups=False).reset_index()
+    X = traj_vecs[list(range(N_STEPS))].values
+
+    inertias = []
+    ks = range(2, 8)
+    for k in ks:
+        km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        km.fit(X)
+        inertias.append(km.inertia_)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(list(ks), inertias, "o-", color="#3498db", linewidth=2)
+    ax.axvline(x=4, color="#e74c3c", linestyle="--", label="Chosen k=4")
+    ax.set_title("K-Means Elbow Plot — Choosing Number of Archetypes")
+    ax.set_xlabel("Number of Clusters (k)")
+    ax.set_ylabel("Inertia")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "task1_kmeans_elbow.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: task1_kmeans_elbow.png")
+
+
 def run():
     print("=" * 60)
     print("TASK 1: Behavioral Scoring Framework")
@@ -297,23 +437,30 @@ def run():
 
     tables = load_all()
 
-    print("\n[1/4] Engineering weekly behavioral features...")
+    print("\n[1/5] Engineering weekly behavioral features...")
     weekly = build_weekly_features(tables)
     print(f"  -> {len(weekly):,} student-week rows, {weekly['id_student'].nunique():,} unique students")
 
-    print("\n[2/4] Computing composite engagement scores...")
-    scored = compute_engagement_score(weekly)
+    print("\n[2/5] Adding course-adjusted features (Fix 4)...")
+    weekly = add_course_adjusted_features(weekly)
+
+    print("\n[3/5] Learning data-driven weights via Logistic Regression (He/Xavier-inspired, Fix 1)...")
+    feature_weights = learn_feature_weights(weekly, tables)
+
+    print("\n[4/5] Computing engagement scores with per-week scaling (Fix 2)...")
+    scored = compute_engagement_score(weekly, feature_weights)
     print(f"  -> Score range: {scored['engagement_score'].min():.1f} - {scored['engagement_score'].max():.1f}")
     print(f"  -> Mean: {scored['engagement_score'].mean():.1f}, Median: {scored['engagement_score'].median():.1f}")
 
-    print("\n[3/4] Assigning student archetypes...")
-    archetypes = assign_archetypes(scored, tables)
+    print("\n[5/5] Assigning archetypes via K-Means clustering (Fix 3)...")
+    archetypes, kmeans = assign_archetypes_kmeans(scored, tables, n_clusters=4)
     print(archetypes["archetype"].value_counts().to_string())
 
-    print("\n[4/4] Generating visualizations...")
+    print("\n[6/6] Generating visualizations...")
+    plot_kmeans_elbow(scored, tables)
     plot_archetype_trajectories(scored, archetypes)
     plot_score_distribution(scored, tables)
-    plot_feature_rationale(weekly, tables)
+    plot_feature_rationale(weekly, tables, feature_weights)
 
     scored.to_csv(os.path.join(FIG_DIR, "..", "task1_weekly_scores.csv"), index=False)
     archetypes.to_csv(os.path.join(FIG_DIR, "..", "task1_archetypes.csv"), index=False)
